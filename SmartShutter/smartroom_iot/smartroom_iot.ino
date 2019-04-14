@@ -1,16 +1,16 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
+#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-#include <FirebaseArduino.h>
-#include <NTPtimeESP.h>
-#include <ESP8266HTTPClient.h>
+#include <IOXhop_FirebaseESP32.h>
+#include <HTTPClient.h>
+#include "time.h"
+#include "credentials.h"
 
-NTPtime NTPch("0.pt.pool.ntp.org");
-#define FIREBASE_HOST "XXXX"                         // the project name address from firebase id
-#define FIREBASE_AUTH "XXXX"                    // the secret key generated from firebase
-#define WIFI_SSID "XXXX"                                          // input your home or public wifi name 
-#define WIFI_PASSWORD "XXXX"      //password of wifi ssid
+//RTC 
+//0.pt.pool.ntp.org
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600;
+const int   daylightOffset_sec = 3600;
 
 bool lowActivation = false;
 
@@ -24,9 +24,9 @@ int clouds_all; // Cloudiness, %
 float rain_1h;  // Rain volume for the last 1 hour, mm
 
 
-int relayUP = D1; 
-int relayDOWN = D2;
-int ledPin = D4;
+int relayUP = 27; //laranja
+int relayDOWN = 25; //Amarelo
+int BUILT_IN_LED = 32;
 
 bool smartOpening = false;
 
@@ -47,7 +47,6 @@ bool OTA = false;
 
 float state = 0.0;
 
-strDateTime dateTime;
 
 int hour;
 int minute;
@@ -87,24 +86,24 @@ void setPoints() {
 
 void fx() {
   m1 = ( ((float) py) / ((float) px) );
-  Firebase.set("janela/fuc/py", py);
-  Firebase.set("janela/fuc/px", px);
+  Firebase.set("window/fuc/py", py);
+  Firebase.set("window/fuc/px", px);
   String fx = "f(x)=";
   fx += String(m1) + "x";
-  Firebase.setString("janela/fuc/fx", fx);
+  Firebase.setString("window/fuc/fx", fx);
 
 }
 
 void fg() {
   m2 = ( (  ky -  py) / ( kx -  px) );
   b2 = ky - (m2 * kx);
-  Firebase.set("janela/fuc/ky", ky);
-  Firebase.set("janela/fuc/kx", kx);
+  Firebase.set("window/fuc/ky", ky);
+  Firebase.set("window/fuc/kx", kx);
   String fg = "f(g)=";
   fg += String(m2) + "x";
   if (b2 > 0) fg += " + "; else fg += " - ";
   fg += fabs(b2);
-  Firebase.setString("janela/fuc/fg", fg);
+  Firebase.setString("window/fuc/fg", fg);
 }
 
 float fx(float x) {
@@ -115,14 +114,23 @@ float fg(float x) {
   return m2 * x + b2;
 }
 
+void printLocalTime(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+
 
 void setup() {
   Serial.begin(9600);
 
   pinMode(relayUP, OUTPUT);
   pinMode(relayDOWN, OUTPUT);
-  pinMode(ledPin, OUTPUT);
-  pinMode(16, OUTPUT);
+  pinMode(BUILT_IN_LED, OUTPUT);
+
   resetRelays();
 
   // connect to wifi.
@@ -131,17 +139,21 @@ void setup() {
   Serial.print("connecting");
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
-    digitalWrite(ledPin, LOW);  
+    digitalWrite(BUILT_IN_LED, HIGH);
     delay(500);
-    
   }
   
-
-
   Serial.println();
   Serial.print("connected: ");
   Serial.println(WiFi.localIP());
 
+  digitalWrite(BUILT_IN_LED, LOW);
+
+
+  //Setting ESP32 RTC time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  //ArduinoOTA for over the air flashing
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -175,13 +187,21 @@ void setup() {
   });
   ArduinoOTA.begin();
 
+   //Firebase initialization
   Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
-  Firebase.stream("/");
-  Firebase.set("janela/buzy", buzy);
-  state = Firebase.getFloat("janela/state");
-  Firebase.setBool("data/ota",false);
-  updateData();
 
+  Firebase.stream("/", [](FirebaseStream stream) {
+    handleFirebaseStream(stream);
+  });
+
+  //Resets "device buzy" to false
+  Firebase.set("window/buzy", false);
+  //Gets corrent state of shutter
+  state = Firebase.getFloat("window/state");
+  //Reset OTA flag
+  Firebase.setBool("data/ota", false);
+  
+  updateData();
 }
 
 void printStatus() {
@@ -239,105 +259,65 @@ void printStatus() {
   */
 }
 
+void handleFirebaseStream(FirebaseStream event) {
+  String eventType = event.getEvent();
+  eventType.toLowerCase();
+
+  Serial.print("event: ");
+  Serial.print(eventType);
+  Serial.print(" path ");
+  Serial.println(event.getPath());
+
+ 
+
+  //event.getJsonVariant().printTo(Serial);
+
+  if (eventType == "put") {
+    updateData(event);
+  }
+
+  if (eventType == "patch" && event.getPath() == "/data") {
+     event.getData().printTo(Serial);
+    
+    float val = event.getData()["state"].as<float>();
+    Serial.print("state: ");
+    Serial.println(val);
+    setWindowState(val);
+  }
+}
+
 int time_elapsed = 0;
-void loop() {  
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(BUILT_IN_LED, HIGH);
+  } else {
+    digitalWrite(BUILT_IN_LED, LOW);
+  }
 
-   if (WiFi.status() != WL_CONNECTED) {
-       digitalWrite(ledPin, LOW);
-   }else{
-           digitalWrite(ledPin, HIGH);
-
-    }
-   
-  if(OTA){
-    while(time_elapsed < 15000){
+  if (OTA) {
+    while (time_elapsed < 15000) {
       ArduinoOTA.handle();
       time_elapsed += 50;
       delay(50);
     }
-    Firebase.setBool("data/ota",false);
+    Firebase.setBool("data/ota", false);
     OTA = false;
     return;
   }
+
+  printLocalTime();
+
+
+
+  //fetchWeather();
+
+  //triggerAlarmClock();
+
+  //printStatus();
+
   
-  digitalWrite(16, LOW);   
 
-
-  dateTime = NTPch.getNTPtime(1, 0);
-
-
-  hour = dateTime.hour;
-  minute = dateTime.minute;
-  dayOfWeek = dateTime.dayofWeek;
-
-  minuteTime = hour * 60 + minute;
-
-  fetchWeather();
-
-  triggerAlarmClock();
-
-
-  printStatus();
-
-  if (Firebase.failed()) {
-    Serial.println("streaming error");
-    Serial.println(Firebase.error());
-    Firebase.stream("/");
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
-    delay(50);
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
-    delay(50);
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
-    delay(50);
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
-    delay(50);
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
-    delay(50);
-    digitalWrite(ledPin, LOW);
-    delay(50);
-    digitalWrite(ledPin, HIGH);  
   
-    errorCounter++;
-    if (errorCounter > 10) ESP.reset();
-  }
-
-  if (Firebase.available()) {
-    digitalWrite(ledPin, HIGH);
-
-    FirebaseObject event = Firebase.readEvent();
-
-    String eventType = event.getString("type");
-    eventType.toLowerCase();
-
-    Serial.print("event: ");
-    Serial.println(eventType);
-
-    event.getJsonVariant().printTo(Serial);
-
-    if (eventType == "put") {
-      updateData(event);
-    }
-
-    if (eventType == "patch") {
-
-      float val = event.getFloat("data/state");
-      Serial.print("state: ");
-      Serial.println(val);
-      setWindowState(val);
-
-    }
-  }
-  digitalWrite(16, HIGH);   
   delay(1000);
 }
 
@@ -433,46 +413,45 @@ void updateData() {
 
 
 
-void updateData(FirebaseObject event) {
-  if (event.getString("path").indexOf("janela") != -1) return;
+void updateData(FirebaseStream event) {
+  if (event.getPath().indexOf("window") != -1) return;
 
-  if (event.getString("path") == "/data/py")
-    py = event.getFloat("data");
+  if (event.getPath() == "/data/px")
+    py = event.getDataFloat();
 
-  if (event.getString("path") == "/data/cycleDuration")
-    CYCLE_DURATION = event.getInt("data");
+  if (event.getPath() == "/data/cycleDuration")
+    CYCLE_DURATION = event.getDataInt();
 
-  if (event.getString("path") == "/data/cycleCount")
-    CYCLE_COUNT = event.getInt("data");
+  if (event.getPath() == "/data/cycleCount")
+    CYCLE_COUNT = event.getDataInt();
 
-  if (event.getString("path") == "/data/weekCloseTime")
-    WEEK_CLOSE_TIME = event.getInt("data");
+  if (event.getPath() == "/data/weekCloseTime")
+    WEEK_CLOSE_TIME = event.getDataInt();
 
-  if (event.getString("path") == "/data/weekOpenTime") {
-    WEEK_OPEN_TIME = event.getInt("data");
+  if (event.getPath() == "/data/weekOpenTime") {
+    WEEK_OPEN_TIME = event.getDataInt();
   }
 
-  if (event.getString("path") == "/data/weekendCloseTime") {
-    WEEKEND_CLOSE_TIME = event.getInt("data");
+  if (event.getPath() == "/data/weekendCloseTime") {
+    WEEKEND_CLOSE_TIME = event.getDataInt();
   }
 
-  if (event.getString("path") == "/data/weekendOpenTime") {
-    WEEKEND_OPEN_TIME = event.getInt("data");
+  if (event.getPath() == "/data/weekendOpenTime") {
+    WEEKEND_OPEN_TIME = event.getDataInt();
     Serial.print("Firebase event: weekendOpenTime: ");
     Serial.println(WEEKEND_OPEN_TIME);
   }
 
-  if (event.getString("path") == "/data/cycleCount" || event.getString("path") == "/data/cycleDuration" || event.getString("path") == "/data/py" ) {
+  if (event.getPath() == "/data/cycleCount" || event.getPath() == "/data/cycleDuration" || event.getPath() == "/data/px" ) {
     setPoints();
     PERIOD = CYCLE_DURATION /  CYCLE_COUNT;
   }
 
-  if(event.getString("path") == "/data/ota"){
-    OTA = event.getBool("data");
+  if (event.getPath() == "/data/ota") {
+    OTA = event.getDataBool();
   }
-  
-}
 
+}
 
 
 
@@ -482,7 +461,7 @@ void updateData(FirebaseObject event) {
 void setWindowState(float nwState) {
   Serial.print("new state: ");
   Serial.println(nwState);
-//|| (limitedMode && state > 0.36)
+  //|| (limitedMode && state > 0.36)
   if (buzy || state == nwState ) return;
 
   int t = fabs(nwState - state) * WINDOW_ACTIVE_FULL;
@@ -491,8 +470,8 @@ void setWindowState(float nwState) {
   if (t < 500) return;
 
   buzy = true;
-  if(t>1000)
-  Firebase.set("janela/buzy", buzy);
+  if (t > 1000)
+    Firebase.set("window/buzy", buzy);
   resetRelays();
 
 
@@ -512,22 +491,21 @@ void setWindowState(float nwState) {
   state = nwState;
 
   buzy = false;
-  if(t>1000)
-  Firebase.set("janela/buzy", buzy);
-  if(t>1000)
-  Firebase.set("janela/state", state);
+  if (t > 1000)
+    Firebase.set("window/buzy", buzy);
+  if (t > 1000)
+    Firebase.set("window/state", state);
 
 }
 
 void fetchWeather() {
   if (lastWeatherQueryTime == minuteTime && (minuteTime % 10) != 0) {
-    return;
-    Serial.println("RETURNED");
-  }
+    return; 
+ }
 
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;  //Object of class HTTPClient
-    http.begin("http://api.openweathermap.org/data/2.5/weather?q=Cacia,PT&appid=eeee5d398a4f7e3ed74bf9c3ec65f341&units=metric");
+    http.begin("http://api.openweathermap.org/data/2.5/weather?q=" + WEATHER_LOCAL +  "&appid=" + WEATHER_API_KEY + "&units=" + WEATHER_UNITS);
     int httpCode = http.GET();
     //Check the returning code
     if (httpCode > 0) {
@@ -578,7 +556,7 @@ void parseWeather(String jsonString) {
   //long sys_sunset = sys["sunset"]; // 1554577387
   int cod = root["cod"]; // 200
 
-  if(weather_0_main == "Rain"){
+  if (weather_0_main == "Rain") {
     Serial.print("Limited Mode Enabled");
     limitedMode = true;
   }
