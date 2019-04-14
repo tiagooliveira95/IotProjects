@@ -6,22 +6,37 @@
 #include "time.h"
 #include "credentials.h"
 
-//RTC 
+//RTC
 //0.pt.pool.ntp.org
+
+
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 3600;
+const char* ntpServer1 = "0.pt.pool.ntp.org";
+
+
+const long  gmtOffset_sec = 0;
 const int   daylightOffset_sec = 3600;
 
-bool lowActivation = false;
+bool daylight = 0;
 
+
+hw_timer_t * timer = NULL;
+volatile SemaphoreHandle_t timerSemaphore;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+//Multicore
+TaskHandle_t Task1;
+
+
+bool lowActivation = false;
 bool limitedMode = false;
 
 int lastWeatherQueryTime = 0;
 
 float main_temp;
-const char* weather_0_main; // Rain
-int clouds_all; // Cloudiness, %
-float rain_1h;  // Rain volume for the last 1 hour, mm
+const char* weather_0_main = ""; // Rain
+int clouds_all = 0; // Cloudiness, %
+float rain_1h = 0.0;  // Rain volume for the last 1 hour, mm
 
 
 int relayUP = 27; //laranja
@@ -114,46 +129,42 @@ float fg(float x) {
   return m2 * x + b2;
 }
 
-void printLocalTime(){
+void printLocalTime() {
   struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
+  if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to obtain time");
     return;
   }
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  minuteTime = timeinfo.tm_hour * 60 + timeinfo.tm_min;
 }
 
+// Runs every 10 minutes
+void IRAM_ATTR onTimer() {
+  Serial.println("onTimer");
+}
 
-void setup() {
-  Serial.begin(9600);
+void setRepeatAlarm() {
+  // Create semaphore to inform us when the timer has fired
+  timerSemaphore = xSemaphoreCreateBinary();
 
-  pinMode(relayUP, OUTPUT);
-  pinMode(relayDOWN, OUTPUT);
-  pinMode(BUILT_IN_LED, OUTPUT);
+  // Use 1st timer of 4 (counted from zero).
+  // Set 80 divider for prescaler (see ESP32 Technical Reference Manual for more
+  // info).
+  timer = timerBegin(0, 80, true);
 
-  resetRelays();
+  // Attach onTimer function to our timer.
+  timerAttachInterrupt(timer, &onTimer, true);
 
-  // connect to wifi.
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    digitalWrite(BUILT_IN_LED, HIGH);
-    delay(500);
-  }
-  
-  Serial.println();
-  Serial.print("connected: ");
-  Serial.println(WiFi.localIP());
+  // Set alarm to call onTimer function every 10 minutes (value in microseconds).
+  // Repeat the alarm (third parameter)
+  timerAlarmWrite(timer, 1000000 * 60 * 10, true);
 
-  digitalWrite(BUILT_IN_LED, LOW);
+  // Start an alarm
+  timerAlarmEnable(timer);
+}
 
-
-  //Setting ESP32 RTC time
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-  //ArduinoOTA for over the air flashing
+void startOTA() {
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -187,36 +198,110 @@ void setup() {
   });
   ArduinoOTA.begin();
 
-   //Firebase initialization
-  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+}
 
+void beginFirebaseStream() {
   Firebase.stream("/", [](FirebaseStream stream) {
     handleFirebaseStream(stream);
   });
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(relayUP, OUTPUT);
+  pinMode(relayDOWN, OUTPUT);
+  pinMode(BUILT_IN_LED, OUTPUT);
+
+  setRepeatAlarm();
+
+  resetRelays();
+
+  // connect to wifi.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    digitalWrite(BUILT_IN_LED, HIGH);
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.print("connected: ");
+  Serial.println(WiFi.localIP());
+
+  digitalWrite(BUILT_IN_LED, LOW);
+
+  xTaskCreatePinnedToCore(
+    Core0, /* Function to implement the task */
+    "Core0", /* Name of the task */
+    10000,  /* Stack size in words */
+    NULL,  /* Task input parameter */
+    0,  /* Priority of the task */
+    &Task1,  /* Task handle. */
+    0); /* Core where the task should run */
+
+  //Setting ESP32 RTC time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer,ntpServer1);
+  printLocalTime();
+
+  fetchWeather();
+
+  //ArduinoOTA for over the air flashing
+  startOTA();
+
+  //Firebase initialization
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
 
   //Resets "device buzy" to false
   Firebase.set("window/buzy", false);
-  //Gets corrent state of shutter
+  //Gets current state of shutter
   state = Firebase.getFloat("window/state");
   //Reset OTA flag
   Firebase.setBool("data/ota", false);
-  
+
   updateData();
+
+  beginFirebaseStream();
+}
+
+void loop() {}
+
+int time_elapsed = 0;
+void Core0( void * parameter) {
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      digitalWrite(BUILT_IN_LED, HIGH);
+    } else {
+      digitalWrite(BUILT_IN_LED, LOW);
+    }
+
+    if (OTA) {
+      while (time_elapsed < 15000) {
+        ArduinoOTA.handle();
+        time_elapsed += 50;
+        delay(50);
+      }
+      Firebase.setBool("data/ota", false);
+      OTA = false;
+      return;
+    }
+
+    printLocalTime();
+
+    triggerAlarmClock();
+
+    printStatus();
+
+    delay(1000);
+  }
 }
 
 void printStatus() {
-  Serial.print(hour);
-  Serial.print(":");
-  Serial.print(minute);
-  Serial.print(" , week ");
-  Serial.print(dayOfWeek);
-  Serial.print(" , minTime: ");
-  Serial.print(minuteTime);
-
-  Serial.print(" , Temp ");
+  Serial.print(" Temp ");
   Serial.print(main_temp);
-  Serial.print(" , Weather ");
-  Serial.print(weather_0_main);
   Serial.print(" , Clouds ");
   Serial.print(clouds_all);
   Serial.print(" , Rain/mm ");
@@ -268,8 +353,6 @@ void handleFirebaseStream(FirebaseStream event) {
   Serial.print(" path ");
   Serial.println(event.getPath());
 
- 
-
   //event.getJsonVariant().printTo(Serial);
 
   if (eventType == "put") {
@@ -277,8 +360,8 @@ void handleFirebaseStream(FirebaseStream event) {
   }
 
   if (eventType == "patch" && event.getPath() == "/data") {
-     event.getData().printTo(Serial);
-    
+    event.getData().printTo(Serial);
+
     float val = event.getData()["state"].as<float>();
     Serial.print("state: ");
     Serial.println(val);
@@ -286,40 +369,6 @@ void handleFirebaseStream(FirebaseStream event) {
   }
 }
 
-int time_elapsed = 0;
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(BUILT_IN_LED, HIGH);
-  } else {
-    digitalWrite(BUILT_IN_LED, LOW);
-  }
-
-  if (OTA) {
-    while (time_elapsed < 15000) {
-      ArduinoOTA.handle();
-      time_elapsed += 50;
-      delay(50);
-    }
-    Firebase.setBool("data/ota", false);
-    OTA = false;
-    return;
-  }
-
-  printLocalTime();
-
-
-
-  //fetchWeather();
-
-  //triggerAlarmClock();
-
-  //printStatus();
-
-  
-
-  
-  delay(1000);
-}
 
 void triggerAlarmClock() {
   if (minuteTime == 0) {
@@ -412,7 +461,6 @@ void updateData() {
 }
 
 
-
 void updateData(FirebaseStream event) {
   if (event.getPath().indexOf("window") != -1) return;
 
@@ -442,9 +490,12 @@ void updateData(FirebaseStream event) {
     Serial.println(WEEKEND_OPEN_TIME);
   }
 
+
   if (event.getPath() == "/data/cycleCount" || event.getPath() == "/data/cycleDuration" || event.getPath() == "/data/px" ) {
     setPoints();
-    PERIOD = CYCLE_DURATION /  CYCLE_COUNT;
+    if (CYCLE_COUNT > 0)
+      PERIOD = CYCLE_DURATION /  CYCLE_COUNT;
+
   }
 
   if (event.getPath() == "/data/ota") {
@@ -452,7 +503,6 @@ void updateData(FirebaseStream event) {
   }
 
 }
-
 
 
 /*
@@ -500,8 +550,8 @@ void setWindowState(float nwState) {
 
 void fetchWeather() {
   if (lastWeatherQueryTime == minuteTime && (minuteTime % 10) != 0) {
-    return; 
- }
+    return;
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;  //Object of class HTTPClient
@@ -560,9 +610,7 @@ void parseWeather(String jsonString) {
     Serial.print("Limited Mode Enabled");
     limitedMode = true;
   }
-
 }
-
 
 void resetRelays() {
   digitalWrite(relayUP, lowActivation);
