@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <IOXhop_FirebaseESP32.h>
 #include <HTTPClient.h>
 #include "time.h"
@@ -8,6 +10,17 @@
 
 //RTC
 //0.pt.pool.ntp.org
+
+// Data output of DS18B20 is connected to nodemcu GPIO 5 or D1
+#define ONE_WIRE_BUS 32
+
+// Setting a one wire instance
+OneWire oneWire(ONE_WIRE_BUS);
+// Passing onewire instance to Dallas Temperature sensor library
+DallasTemperature sensors(&oneWire);
+
+int Celsius1=0;     //Variables to store temperature readings from DS18B20 temperature sensors
+int Celsius2=0;
 
 
 const char* ntpServer = "pool.ntp.org";
@@ -28,7 +41,7 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t Task1;
 
 
-bool lowActivation = false;
+bool lowActivation = true;
 bool limitedMode = false;
 
 int lastWeatherQueryTime = 0;
@@ -41,7 +54,21 @@ float rain_1h = 0.0;  // Rain volume for the last 1 hour, mm
 
 int relayUP = 27; //laranja
 int relayDOWN = 25; //Amarelo
-int BUILT_IN_LED = 32;
+int BUILT_IN_LED = 22;
+
+void blinkLED(){
+  digitalWrite(BUILT_IN_LED, LOW);   // turn the LED on (HIGH is the voltage level)
+  delay(200);                       // wait for a second
+  digitalWrite(BUILT_IN_LED, HIGH);    // turn the LED off by making the voltage LOW
+  delay(200); 
+  digitalWrite(BUILT_IN_LED, LOW);   // turn the LED on (HIGH is the voltage level)
+  delay(200);                       // wait for a second
+  digitalWrite(BUILT_IN_LED, HIGH);    // turn the LED off by making the voltage LOW
+  delay(200);  
+  digitalWrite(BUILT_IN_LED, LOW);   // turn the LED on (HIGH is the voltage level)
+  delay(200);                       // wait for a second
+  digitalWrite(BUILT_IN_LED, HIGH);    // turn the LED off by making the voltage LOW  
+}
 
 bool smartOpening = false;
 
@@ -137,6 +164,8 @@ void printLocalTime() {
   }
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
   minuteTime = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  
+  dayOfWeek = timeinfo.tm_wday;
 }
 
 // Runs every 10 minutes
@@ -299,13 +328,39 @@ void Core0( void * parameter) {
   }
 }
 
+void sendTempSensorDataToServer(){
+  sensors.requestTemperatures(); //Call all sensors on one wire to start calculating the temperature readings
+  Celsius1 = sensors.getTempCByIndex(0);   //Get temperature reading from sensor 0 in celsius scale
+  Celsius2 = sensors.getTempCByIndex(1);   //Get temperature reading from sensor 0 in celsius scale
+  Serial.println(Celsius1);
+  Serial.println(Celsius2);
+}
+
 void printStatus() {
-  Serial.print(" Temp ");
+  //sendTempSensorDataToServer();
+  Serial.print("Temperature: ");
   Serial.print(main_temp);
   Serial.print(" , Clouds ");
   Serial.print(clouds_all);
   Serial.print(" , Rain/mm ");
-  Serial.println(rain_1h);
+  Serial.print(rain_1h);
+  Serial.print(" current state: ");
+  Serial.println(state);
+  Serial.print("[ WEEK: {open: ");
+  Serial.print(WEEK_OPEN_TIME);
+  Serial.print(", close: ");
+  Serial.print(WEEK_CLOSE_TIME);
+  Serial.print("}, WEEKEND: {open: ");
+  Serial.print(WEEKEND_OPEN_TIME);
+  Serial.print(", close: ");
+  Serial.print(WEEKEND_CLOSE_TIME);
+  Serial.println("} ]");
+
+
+  digitalWrite(BUILT_IN_LED, LOW);   
+  delay(100);                       
+  digitalWrite(BUILT_IN_LED, HIGH);    
+  delay(100); 
 
   /*Serial.print(" HEAP: ");
      Serial.println(ESP.getFreeHeap());
@@ -355,11 +410,14 @@ void handleFirebaseStream(FirebaseStream event) {
 
   //event.getJsonVariant().printTo(Serial);
 
+  blinkLED();
+
   if (eventType == "put") {
     updateData(event);
   }
 
   if (eventType == "patch" && event.getPath() == "/data") {
+
     event.getData().printTo(Serial);
 
     float val = event.getData()["state"].as<float>();
@@ -503,7 +561,6 @@ void updateData(FirebaseStream event) {
   }
 
 }
-
 
 /*
    @nwState: range -> [0.0 , 1.0]
